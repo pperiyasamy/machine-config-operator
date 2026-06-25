@@ -1921,3 +1921,166 @@ func TestGetEffectiveOSImageStreamName(t *testing.T) {
 		})
 	}
 }
+
+func TestExtensionPackageHistory(t *testing.T) {
+	history := ExtensionPackageHistory()
+
+	// Verify ipsec has historical entry
+	ipsecHistory, exists := history["ipsec"]
+	require.True(t, exists, "ipsec extension should have historical package entry")
+	require.NotEmpty(t, ipsecHistory, "ipsec historical entry should not be empty")
+
+	// Verify the pre-5.0 package set (without openvswitch-ipsec)
+	require.ElementsMatch(t, []string{"NetworkManager-libreswan", "libreswan"}, ipsecHistory,
+		"Pre-5.0 ipsec extension should only have libreswan packages")
+}
+
+func TestGetAllValidPackageSetsForExtension(t *testing.T) {
+	tests := []struct {
+		name              string
+		extension         string
+		expectedSetCount  int
+		shouldContainCurrent bool
+		shouldContainHistorical bool
+	}{
+		{
+			name:              "ipsec extension should have both current and historical sets",
+			extension:         "ipsec",
+			expectedSetCount:  2, // current + 1 historical
+			shouldContainCurrent: true,
+			shouldContainHistorical: true,
+		},
+		{
+			name:              "usbguard extension should only have current set",
+			extension:         "usbguard",
+			expectedSetCount:  1, // only current, no history
+			shouldContainCurrent: true,
+			shouldContainHistorical: false,
+		},
+		{
+			name:              "non-existent extension should return empty",
+			extension:         "non-existent",
+			expectedSetCount:  0,
+			shouldContainCurrent: false,
+			shouldContainHistorical: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			packageSets := GetAllValidPackageSetsForExtension(tt.extension)
+
+			require.Equal(t, tt.expectedSetCount, len(packageSets),
+				"Expected %d package sets for extension %q", tt.expectedSetCount, tt.extension)
+
+			if tt.shouldContainCurrent {
+				// Verify current package set is included
+				currentPackages := SupportedExtensions()[tt.extension]
+				found := false
+				for _, pkgSet := range packageSets {
+					if reflect.DeepEqual(pkgSet, currentPackages) {
+						found = true
+						break
+					}
+				}
+				require.True(t, found, "Current package set should be included for extension %q", tt.extension)
+			}
+
+			if tt.shouldContainHistorical {
+				// Verify historical set is included
+				history := ExtensionPackageHistory()
+				if historicalSet, exists := history[tt.extension]; exists {
+					found := false
+					for _, pkgSet := range packageSets {
+						if reflect.DeepEqual(pkgSet, historicalSet) {
+							found = true
+							break
+						}
+					}
+					require.True(t, found, "Historical package set should be included for extension %q", tt.extension)
+				}
+			}
+		})
+	}
+}
+
+func TestGetAllValidPackageSetsForIpsec(t *testing.T) {
+	// Specific test for ipsec to verify exact package sets
+	packageSets := GetAllValidPackageSetsForExtension("ipsec")
+
+	require.Equal(t, 2, len(packageSets), "ipsec should have 2 package sets (current + historical)")
+
+	// Current set (5.0+) should include openvswitch3.5-ipsec
+	currentSet := packageSets[0]
+	require.ElementsMatch(t, []string{"NetworkManager-libreswan", "libreswan", "openvswitch3.5-ipsec"}, currentSet,
+		"Current ipsec package set should include openvswitch3.5-ipsec")
+
+	// Historical set (pre-5.0) should not include openvswitch-ipsec
+	historicalSet := packageSets[1]
+	require.ElementsMatch(t, []string{"NetworkManager-libreswan", "libreswan"}, historicalSet,
+		"Historical ipsec package set should only have libreswan packages")
+}
+
+func TestExtensionPackageHistoryUpgradeScenario(t *testing.T) {
+	// This test simulates the upgrade scenario from 4.x to 5.0
+	// where the new MCD code runs before the OS image update
+
+	// Scenario: ipsec extension is configured
+	extension := "ipsec"
+
+	// Get all valid package sets
+	validSets := GetAllValidPackageSetsForExtension(extension)
+	require.Greater(t, len(validSets), 0, "Should have at least one valid package set")
+
+	// Simulate old system (4.x) with only libreswan packages installed
+	installedPackages := map[string]bool{
+		"NetworkManager-libreswan": true,
+		"libreswan":                true,
+		// openvswitch3.5-ipsec is NOT installed yet
+	}
+
+	// Verify that at least one valid package set matches the installed packages
+	foundMatch := false
+	for _, pkgSet := range validSets {
+		allPresent := true
+		for _, pkg := range pkgSet {
+			if !installedPackages[pkg] {
+				allPresent = false
+				break
+			}
+		}
+		if allPresent {
+			foundMatch = true
+			t.Logf("Found matching package set during upgrade: %v", pkgSet)
+			break
+		}
+	}
+
+	require.True(t, foundMatch, "Should find a valid package set matching the old OS image state")
+
+	// Simulate new system (5.0) with all packages installed
+	newInstalledPackages := map[string]bool{
+		"NetworkManager-libreswan": true,
+		"libreswan":                true,
+		"openvswitch3.5-ipsec":     true,
+	}
+
+	// Verify that at least one valid package set matches the new installed packages
+	foundNewMatch := false
+	for _, pkgSet := range validSets {
+		allPresent := true
+		for _, pkg := range pkgSet {
+			if !newInstalledPackages[pkg] {
+				allPresent = false
+				break
+			}
+		}
+		if allPresent {
+			foundNewMatch = true
+			t.Logf("Found matching package set after upgrade: %v", pkgSet)
+			break
+		}
+	}
+
+	require.True(t, foundNewMatch, "Should find a valid package set matching the new OS image state")
+}

@@ -556,6 +556,8 @@ func GetPackagesForSupportedExtensions(exts []string) ([]string, error) {
 }
 
 // Returns list of extensions possible to install on a CoreOS based system.
+// This returns the CURRENT package list for each extension.
+// For historical package lists (needed during upgrades), see ExtensionPackageHistory().
 func SupportedExtensions() map[string][]string {
 	// In future when list of extensions grow, it will make
 	// more sense to populate it in a dynamic way.
@@ -571,6 +573,58 @@ func SupportedExtensions() map[string][]string {
 		"sandboxed-containers": {"kata-containers"},
 		"sysstat":              {"sysstat"},
 	}
+}
+
+// ExtensionPackageHistory tracks the previous package list for extensions that have changed.
+// This is used during upgrades to handle the case where the new MCD code
+// rolls out before the OS image update, creating a temporary mismatch.
+//
+// During upgrades, package verification should accept EITHER:
+// - The current package set (defined in SupportedExtensions), OR
+// - The historical package set defined here (from the previous version)
+//
+// CLEANUP POLICY:
+// Historical entries should be removed after sufficient time has passed to ensure
+// all supported upgrade paths have been covered. The general rule is:
+// - Keep historical entries for at least 2 releases after introduction
+// - For EUS releases, keep until the next EUS release + 1
+// - Example: A change introduced in 5.0 should be kept until at least 5.2,
+//   or beyond the next EUS release if 5.1 or 5.2 is EUS
+//
+// Format: map[extension_name]previousPackageList
+func ExtensionPackageHistory() map[string][]string {
+	return map[string][]string{
+		// ipsec extension package history:
+		// - Before 5.0 (4.x releases): only had libreswan packages
+		// - 5.0+: added openvswitch3.5-ipsec for OVN-Kubernetes IPsec support
+		// TODO(removal): Remove this entry after 5.2 release or next EUS + 1
+		"ipsec": {"NetworkManager-libreswan", "libreswan"},
+	}
+}
+
+// GetAllValidPackageSetsForExtension returns all valid package sets for an extension,
+// including both current and historical package lists. This is used during verification
+// to handle upgrade scenarios gracefully.
+//
+// During an upgrade (e.g., 4.x → 5.0), the new MCD code may run before the OS image
+// updates. This function ensures that verification accepts either the old package set
+// (from the current OS image) OR the new package set (from the updated code).
+func GetAllValidPackageSetsForExtension(extension string) [][]string {
+	var allSets [][]string
+
+	// Add current package set
+	supported := SupportedExtensions()
+	if current, exists := supported[extension]; exists {
+		allSets = append(allSets, current)
+	}
+
+	// Add historical package set (if exists)
+	history := ExtensionPackageHistory()
+	if historical, exists := history[extension]; exists {
+		allSets = append(allSets, historical)
+	}
+
+	return allSets
 }
 
 // IgnParseWrapper parses rawIgn for both V2 and V3 ignition configs and returns

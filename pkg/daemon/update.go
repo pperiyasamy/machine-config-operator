@@ -1855,6 +1855,11 @@ func (dn *CoreOSDaemon) applyExtensions(oldConfig, newConfig *mcfgv1.MachineConf
 
 // verifyExtensionsStaged verifies that all extension packages specified in a MachineConfig
 // are staged in the rpm-ostree deployment before the node enters a reboot.
+//
+// This function handles upgrades gracefully by accepting EITHER the current package set
+// OR any historical package set for each extension. This prevents verification failures
+// during upgrades when the new MCD code rolls out before the OS image update.
+//
 // See: https://redhat.atlassian.net/browse/OCPBUGS-65645
 func (dn *CoreOSDaemon) verifyExtensionsStaged(config *mcfgv1.MachineConfig) error {
 	// Only verify on RHCOS/SCOS nodes
@@ -1869,13 +1874,7 @@ func (dn *CoreOSDaemon) verifyExtensionsStaged(config *mcfgv1.MachineConfig) err
 		return nil
 	}
 
-	// Map extensions to actual package names using the existing helper
-	expectedPackages, err := ctrlcommon.GetPackagesForSupportedExtensions(extensions)
-	if err != nil {
-		return fmt.Errorf("failed to get packages for extensions: %w", err)
-	}
-
-	klog.Infof("Verifying %d extension packages are staged for config %s", len(expectedPackages), config.GetName())
+	klog.Infof("Verifying extension packages are staged for config %s", config.GetName())
 
 	// Get the staged deployment
 	_, staged, err := dn.NodeUpdaterClient.GetBootedAndStagedDeployment()
@@ -1890,25 +1889,92 @@ func (dn *CoreOSDaemon) verifyExtensionsStaged(config *mcfgv1.MachineConfig) err
 	// Create a set of requested packages in the staged deployment for quick lookup
 	stagedPackages := sets.New(staged.RequestedPackages...)
 
-	// Verify each expected package is in the staged deployment
-	var missingPackages []string
-	for _, pkg := range expectedPackages {
-		if !stagedPackages.Has(pkg) {
-			missingPackages = append(missingPackages, pkg)
-			klog.Warningf("Extension package %s not found in staged deployment", pkg)
+	// Verify each extension individually, accepting any valid package set
+	for _, ext := range extensions {
+		// Get all valid package sets for this extension (current + historical)
+		validPackageSets := ctrlcommon.GetAllValidPackageSetsForExtension(ext)
+		if len(validPackageSets) == 0 {
+			return fmt.Errorf("extension %q has no valid package sets defined", ext)
+		}
+
+		// Try to match against any valid package set
+		var matchedSet []string
+		var allMissingPackages [][]string
+
+		for _, packageSet := range validPackageSets {
+			var missingPkgs []string
+			allPresent := true
+
+			for _, pkg := range packageSet {
+				if !stagedPackages.Has(pkg) {
+					missingPkgs = append(missingPkgs, pkg)
+					allPresent = false
+				}
+			}
+
+			if allPresent {
+				matchedSet = packageSet
+				klog.Infof("Extension %q verified in staged deployment with package set: %v", ext, packageSet)
+				break
+			}
+
+			allMissingPackages = append(allMissingPackages, missingPkgs)
+		}
+
+		// If no package set matched, the extension verification failed
+		if matchedSet == nil {
+			return fmt.Errorf("extension %q verification failed: no valid package set is fully staged. Tried %d package set(s), missing packages per set: %v",
+				ext, len(validPackageSets), allMissingPackages)
 		}
 	}
 
-	if len(missingPackages) > 0 {
-		return fmt.Errorf("the following extension packages are missing from the staged deployment: %v", missingPackages)
+	klog.Infof("Successfully verified all extension packages are staged")
+	return nil
+}
+
+// isPackageInstalled checks if a package is installed in the RPM database.
+// Returns true if installed, false if not installed, or an error for other failures.
+func isPackageInstalled(pkg string) (bool, error) {
+	out, err := exec.Command("rpm", "-q", pkg).CombinedOutput()
+	if err == nil {
+		return true, nil
 	}
 
-	klog.Infof("Successfully verified all %d extension packages are staged", len(expectedPackages))
-	return nil
+	// Check if this is exit code 1 (package not installed) vs other errors
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, nil
+	}
+
+	// Other errors (execution failure, permission issues, etc.)
+	return false, fmt.Errorf("failed to query RPM database for package %q: %v: %s", pkg, err, strings.TrimSpace(string(out)))
+}
+
+// areAllPackagesInstalled checks if all packages in a list are installed in the RPM database.
+// Returns true if all are installed, false if any are missing, or an error for query failures.
+func areAllPackagesInstalled(packages []string) (bool, []string, error) {
+	var missingPackages []string
+
+	for _, pkg := range packages {
+		installed, err := isPackageInstalled(pkg)
+		if err != nil {
+			return false, nil, err
+		}
+		if !installed {
+			missingPackages = append(missingPackages, pkg)
+		}
+	}
+
+	return len(missingPackages) == 0, missingPackages, nil
 }
 
 // verifyExtensionPackages verifies that all extension packages specified in a
 // MachineConfig are actually installed in the RPM database after a node reboot.
+//
+// This function handles upgrades gracefully by accepting EITHER the current package set
+// OR any historical package set for each extension. This prevents verification failures
+// during upgrades when the new MCD code rolls out before the OS image update.
+//
 // See: https://redhat.atlassian.net/browse/OCPBUGS-65645
 func (dn *CoreOSDaemon) verifyExtensionPackages(config *mcfgv1.MachineConfig) error {
 	// Only verify on RHCOS/SCOS nodes
@@ -1923,39 +1989,43 @@ func (dn *CoreOSDaemon) verifyExtensionPackages(config *mcfgv1.MachineConfig) er
 		return nil
 	}
 
-	// Map extensions to actual package names using the existing helper
-	expectedPackages, err := ctrlcommon.GetPackagesForSupportedExtensions(extensions)
-	if err != nil {
-		return fmt.Errorf("failed to get packages for extensions: %w", err)
-	}
+	klog.Infof("Verifying extension packages are installed for config %s", config.GetName())
 
-	klog.Infof("Verifying %d extension packages are installed for config %s", len(expectedPackages), config.GetName())
-
-	// Verify each package is in the RPM database
-	var missingPackages []string
-	var exitErr *exec.ExitError
-	for _, pkg := range expectedPackages {
-		// Query RPM database directly for installed packages
-		out, err := exec.Command("rpm", "-q", pkg).CombinedOutput()
-		if err == nil {
-			continue
-		}
-		// Check if this is exit code 1 (package not installed) vs other errors
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-			missingPackages = append(missingPackages, pkg)
-			klog.Warningf("Extension package %s not found in RPM database", pkg)
-			continue
+	// Verify each extension individually, accepting any valid package set
+	for _, ext := range extensions {
+		// Get all valid package sets for this extension (current + historical)
+		validPackageSets := ctrlcommon.GetAllValidPackageSetsForExtension(ext)
+		if len(validPackageSets) == 0 {
+			return fmt.Errorf("extension %q has no valid package sets defined", ext)
 		}
 
-		// Other errors (execution failure, permission issues, etc.) should fail immediately
-		return fmt.Errorf("failed to query RPM database for package %q: %v: %s", pkg, err, strings.TrimSpace(string(out)))
+		// Try to match against any valid package set
+		var matchedSet []string
+		var allMissingPackages [][]string
+
+		for _, packageSet := range validPackageSets {
+			allInstalled, missingPkgs, err := areAllPackagesInstalled(packageSet)
+			if err != nil {
+				return err
+			}
+
+			if allInstalled {
+				matchedSet = packageSet
+				klog.Infof("Extension %q verified with package set: %v", ext, packageSet)
+				break
+			}
+
+			allMissingPackages = append(allMissingPackages, missingPkgs)
+		}
+
+		// If no package set matched, the extension verification failed
+		if matchedSet == nil {
+			return fmt.Errorf("extension %q verification failed: no valid package set is fully installed. Tried %d package set(s), missing packages per set: %v",
+				ext, len(validPackageSets), allMissingPackages)
+		}
 	}
 
-	if len(missingPackages) > 0 {
-		return fmt.Errorf("the following extension packages are missing from the RPM database: %v", missingPackages)
-	}
-
-	klog.Infof("Successfully verified all %d extension packages are installed", len(expectedPackages))
+	klog.Infof("Successfully verified all extension packages are installed")
 	return nil
 }
 

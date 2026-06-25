@@ -230,6 +230,30 @@ spec:
     - usbguard
 ```
 
+#### Extension Package Versioning
+
+**New in OpenShift 5.0**: The MCO now supports graceful handling of extension package changes during upgrades.
+
+**Background**: During an OpenShift upgrade, the new Machine Config Daemon (MCD) code rolls out before the OS image update. If an extension's underlying package list changes between versions, this can cause a temporary mismatch where the new MCD expects packages that aren't yet installed, causing nodes to become degraded.
+
+**Solution**: The MCO maintains a historical record of extension package mappings in `pkg/controller/common/helpers.go` via the `ExtensionPackageHistory()` function. During verification, the MCO accepts EITHER:
+- The current package set for the extension, OR
+- Any historical package set defined for that extension
+
+This allows upgrades to proceed smoothly without nodes becoming degraded during the transition period.
+
+**Example**: The `ipsec` extension changed in OpenShift 5.0:
+- **4.x releases**: `ipsec` extension provided only `libreswan` and `NetworkManager-libreswan` packages
+- **5.0+ releases**: `ipsec` extension adds `openvswitch3.5-ipsec` package for OVN-Kubernetes IPsec support
+
+During a 4.x → 5.0 upgrade, nodes with the `ipsec` extension enabled will temporarily have the old package set (2 packages) while running the new MCD code (expecting 3 packages). The verification logic accepts both package sets, preventing degradation.
+
+**For Developers**: When adding or removing packages from an extension:
+1. Update the current package list in `SupportedExtensions()`
+2. Add the previous package list to `ExtensionPackageHistory()` with a TODO comment for removal
+3. Historical entries should be kept for at least 2 releases or beyond the next EUS release
+4. See `pkg/controller/common/helpers.go` for detailed cleanup policy
+
 ### FIPS
 
 This allows to enable/disable [FIPS mode](https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/security_guide/chap-federal_standards_and_regulations). If any of the configuration has FIPS enabled, it'll be set.  A similar restriction applies to this as for `KernelArguments` above.
